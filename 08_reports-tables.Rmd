@@ -1,0 +1,270 @@
+---
+title: "Reference library coverage report"
+author: "Isolde Cornelis"
+date: "`r format(Sys.time(), '%d %B %Y')`"
+output:
+  pdf_document: default
+  pdf: default
+---
+
+```{r load_libs, include=FALSE}
+# load libs
+library("tidyverse")
+library("here")
+library("optparse")
+
+proj.path <- here("/home/genomics/icornelis/03_RawScripts/Step4_Create_ReferenceDB/")
+#proj.path <- here("//192.168.236.131/genomics/icornelis/03_RawScripts/Step4_Create_ReferenceDB/")
+
+# get args
+option_list <- list(
+  make_option(c("-d","--database"), type="character"),
+  make_option(c("-p","--proplen"), type="numeric")
+)
+# set args
+opt <- parse_args(OptionParser(option_list=option_list,add_help_option=FALSE))
+
+# dummy args
+opt <- NULL
+opt$database <- "BeFishingFleet"
+opt$proplen <- 0.9 #proportional minimum length of the barcode 0.9 means 90%
+
+source(here::here(paste0(proj.path,"Scripts/load-libs.R")))
+```
+
+
+```{r load_data, include=FALSE}
+# load up the data
+source(here::here(paste0(proj.path,"Scripts/references-load-local.R")))
+source(here::here(paste0(proj.path,"Scripts/references-clean.R")))
+```
+
+##### Methods and description
+This document describes the contents of the be fish reference library, generated from public databases. 
+The document is a dynamic knitr document and can be updated quickly using the Makefile in `Scripts/`.
+A list of species from the be was generated from two sources: FishBase, and the longterm trawl-data available in-house.
+This list was filtered to identify synonyms and duplicates, and annotated with FishBase taxonomic classification and FishBase common names.
+
+The search was performed on the NCBI nucleotide and BOLD sequences databases. 
+Because of inconsistencies in how researchers annotate their GenBank submissions and the differing internal coverage of primer pairs for particular gene fragments, we performed a search requesting mitochondrial DNA using multiple search relevant search terms (COI, 12S, 16S, rRNA, ribosomal, cytb, CO1, cox1, cytochrome, subunit, COB, CYB, mitochondrial, mitochondrion).
+Then we pulled out fragments of interest using a hidden Markov model. This enabled us to have greater confidence that useful sequences had not been missed.
+For the resulting sequences we then tabulate all their metadata from GenBank in order to allow us the capability to later tailor a custom reference library according to any criteria required (e.g. must have reference specimen or locality data etc). The remaining sequences are concatenated into haplotypes, and sequences shorter than `r opt$proplen*100` % of the median sequence length are removed from the final custom reference library.
+
+```{r activities, include=FALSE}
+# get dates and genbank version
+gb.version <- reflib.cleaned %>% 
+  dplyr::select(genbankVersion) %>% 
+  drop_na() %>% 
+  distinct(genbankVersion) %>% 
+  pull(genbankVersion)
+gb.date <- reflib.cleaned %>% 
+  dplyr::select(searchDate) %>% 
+  drop_na() %>% 
+  distinct(searchDate) %>% 
+  pull(searchDate)
+gb.acc <- reflib.cleaned %>% 
+  distinct(dbid) %>% 
+  count() %>% 
+  pull(n)
+gb.spp <- reflib.cleaned %>% 
+  distinct(sciNameValid) %>% 
+  count() %>% 
+  pull(n)
+```
+
+
+```{r species, include=FALSE}
+# remove synonyms
+be.species.table.val <- be.species.table %>% 
+    dplyr::select(validName,class,order,family,genus,commonName,commonSpecies) %>% 
+    distinct() %>% 
+    #filter(validName!="Pungitius laevis",validName!="Cottus perifretum",validName!="Atherina presbyter") %>%
+    rename(sciNameValid=validName)
+# calculate totals for each group
+be.syns <- be.species.table %>% distinct(speciesName) %>% count() %>% pull(n)
+be.all <- be.species.table.val %>% count() %>% pull(n)
+be.common <- be.species.table.val %>% filter(commonSpecies==TRUE) %>% count() %>% pull(n)
+```
+
+
+```{r merge_df, include=FALSE}
+# count sequences per species-marker
+reflib.by.marker1 <- reflib.cleaned %>% 
+    dplyr::select(sciNameValid,starts_with("nucleotidesFrag")) %>%
+    full_join(be.species.table.val,by="sciNameValid") %>%
+    pivot_longer(cols=!c(class,order,family,genus,commonName,commonSpecies,sciNameValid),names_to="marker",values_to="nucleotides") %>% 
+    mutate(hasSeq=if_else(is.na(nucleotides),0,1)) %>% 
+    group_by(class,order,family,genus,commonName,commonSpecies,sciNameValid,marker) %>%
+    summarise(genbankCount=sum(hasSeq),.groups="drop") %>%
+    mutate(marker=str_replace_all(marker,"nucleotidesFrag.",""), marker=str_replace_all(marker,".noprimers",""))
+
+# adjust reflib.by.marker by setting sequence count to 0 for species were all reference sequences were too short
+reflib.by.marker <- reflib.cleaned %>% 
+    dplyr::select(sciNameValid,contains("noprimers")) %>%
+    rename_at(vars(contains("noprimers")),
+    ~str_replace(.,"\\.", "_")) %>%
+    full_join(be.species.table.val,by="sciNameValid") %>%
+    pivot_longer(cols=!c(class,order,family,genus,commonName,commonSpecies,sciNameValid),
+                 names_to=c(".value", "marker"),
+                 names_sep = '_') %>%
+    group_by(marker) %>%
+    mutate(length = ifelse(lengthFrag >= (median(lengthFrag, na.rm = T)*opt$proplen), 
+                                lengthFrag, NA),
+           nucleotides = ifelse(lengthFrag >= (median(lengthFrag, na.rm = T)*opt$proplen), 
+                                     nucleotidesFrag, NA)) %>%
+    group_by(class,order,family,genus,commonName,commonSpecies,sciNameValid,marker) %>%
+    mutate(hasSeq=if_else(is.na(nucleotides),0,1)) %>% 
+    summarise(genbankCount=sum(hasSeq),.groups="drop") %>%
+    mutate(marker=str_replace_all(marker,"nucleotidesFrag.",""), marker=str_replace_all(marker,".noprimers",""))
+
+```
+
+
+```{r get_haps, include=FALSE}
+# get the prefixes 
+prefixes <- reflib.cleaned %>% dplyr::select(starts_with("nucleotidesFrag")) %>% names() %>% str_replace_all("nucleotidesFrag\\.","")
+# subset each marker
+reflibs.sub <- mcmapply(function(x) subset_nucs(pref=x,df=reflib.cleaned), prefixes, SIMPLIFY=FALSE,USE.NAMES=TRUE,mc.cores=2)
+# collapse dataframe by haps-per-species, annotate with number haps
+reflibs.haps1 <- mcmapply(function(x) haps2fas(df=x), reflibs.sub, SIMPLIFY=FALSE,USE.NAMES=TRUE,mc.cores=2)
+# remove species with reference sequences that are too short (< 0.9 of the median length), to match the table from 06_Clean-Derep-Write
+reflibs.haps <- lapply(reflibs.haps1, function(x) filter(x, lengthFrag >= (median(lengthFrag)*opt$proplen)))
+
+# get seqs/spp lost with reference sequences that are too short 
+seqs.lost <- lapply(reflibs.haps1, sequences_removed, thresh=opt$proplen)  # using the function gives the wrong result because he needs to look for lengthFrag and not length
+seqs.lost <- purrr::map2(reflibs.haps1, reflibs.haps, 
+                             function(x, y) nrow(x)-nrow(y)) #solution, don't use the function since we have both tables
+species_lost <- function(df,thresh){
+    removed <- df %>% filter(lengthFrag < (median(lengthFrag)*thresh)) %>% dplyr::select(sciNameValid)
+    kept <- df %>% filter(lengthFrag >= (median(lengthFrag)*thresh)) %>% dplyr::select(sciNameValid)
+    tot <- setdiff(removed$sciNameValid, kept$sciNameValid)
+    return(length(tot))
+}
+spp.lost <-  lapply(reflibs.haps1, species_lost, thresh=opt$proplen)
+spp.lost.name <- purrr::map2(reflibs.haps1, reflibs.haps, 
+                             function(x, y) unique(x$sciNameValid[!x$sciNameValid %in% y$sciNameValid]))
+
+# summarise
+haps.table <- mapply(reflibs.haps, names(reflibs.haps), FUN=function(x,y) x %>% dplyr::select(sciNameValid) %>% count(sciNameValid) %>% mutate(marker=y), SIMPLIFY=FALSE) %>% purrr::reduce(rbind) %>% mutate(marker=str_replace_all(marker,".noprimers",""))
+# format table with information about the number of sequences and unique species for each barcode
+seqs.table <- data.frame(marker = names(seqs.lost)) %>%
+  mutate(marker=str_replace_all(marker,".noprimers",""),
+         'Unique sequences'= sapply(reflibs.haps, function(x) nrow(x)),
+         'Unique species' = sapply(reflibs.haps, function(x) length(unique(x$sciNameValid))))
+```
+
+```{r summary_tab, include=FALSE}
+# reformat
+marker.table <- reflib.by.marker %>% 
+    group_by(marker) %>% 
+    reframe(
+            `Total sequences`=sum(genbankCount),
+            `Cov. (all)`= length(which(genbankCount>0))/length(genbankCount),
+            `Unique sequences`= nrow(reflibs.haps[[which(grepl(marker, names(reflibs.haps)))]]),
+            `Unique species`= length(which(genbankCount>0)),
+            #`Cov. (common)`=length(which(genbankCount[which(commonSpecies==TRUE)]>0))/length(genbankCount[which(commonSpecies==TRUE)]),
+            #`Cov. (rare)`=length(which(genbankCount[which(commonSpecies==FALSE)]>0))/length(genbankCount[which(commonSpecies==FALSE)]),
+            `Singletons`=length(which(genbankCount==1))/length(which(genbankCount>0)),
+           ) 
+
+marker.table1 <- reflib.by.marker1 %>% 
+    group_by(marker) %>% 
+    reframe(
+            `Total`=sum(genbankCount),
+            `Cov. (all)`=length(which(genbankCount>0))/length(genbankCount),
+            `Cov. (common)`=length(which(genbankCount[which(commonSpecies==TRUE)]>0))/length(genbankCount[which(commonSpecies==TRUE)]),
+            `Cov. (rare)`=length(which(genbankCount[which(commonSpecies==FALSE)]>0))/length(genbankCount[which(commonSpecies==FALSE)]),
+            `Singletons`=length(which(genbankCount==1))/length(which(genbankCount>0))
+    )
+# format haplotype table
+haps.format <- haps.table %>% group_by(marker) %>% summarise(`Haps (mean)`=mean(n),`Haps (median)`=median(n),.groups="drop")
+# join and format
+marker.table.pretty <- marker.table %>% left_join(haps.format) %>% separate(marker,into=c("Locus","Fragment"))
+```
+
+
+```{r versions, include=FALSE}
+# rename new local version
+reflib.new <- reflib.cleaned %>% 
+  dplyr::select(dbid,genbankVersion,searchDate,sciNameValid,starts_with("nucleotidesFrag"))
+# load remote old version
+source(here::here(paste0(proj.path,"Scripts/references-load-remote.R")))
+source(here::here(paste0(proj.path,"Scripts/references-clean.R")))
+# rename old remote version and get genbank accessions
+reflib.old <- reflib.cleaned %>% 
+  dplyr::select(dbid,genbankVersion,searchDate,sciNameValid,starts_with("nucleotidesFrag"))
+gb.version.old <- reflib.old %>% 
+  dplyr::select(genbankVersion) %>% 
+  drop_na() %>% distinct(genbankVersion) %>% 
+  pull(genbankVersion)
+gb.date.old <- reflib.old %>% 
+  dplyr::select(searchDate) %>% 
+  drop_na() %>% distinct(searchDate) %>%
+  pull(searchDate)
+# in old, not in new
+#reflib.old %>% filter(!dbid %in% pull(reflib.new,dbid)) %>% select(dbid,sciNameValid) %>% print(n=Inf)
+# fin ids in new, not in old and clean up
+reflib.new.by.marker <- reflib.new %>% 
+    filter(!dbid %in% pull(reflib.old,dbid)) %>% 
+    dplyr::select(-dbid,-genbankVersion,-searchDate) %>% 
+    pivot_longer(cols=!c(sciNameValid),names_to="marker",values_to="nucleotides") %>% 
+    mutate(hasSeq=if_else(is.na(nucleotides),0,1)) %>% 
+    group_by(sciNameValid,marker) %>%
+    summarise(genbankCount=sum(hasSeq),.groups="drop") %>%
+    mutate(marker=str_replace_all(marker,"nucleotidesFrag.",""), marker=str_replace_all(marker,".noprimers",""))
+```
+
+
+##### Results
+
+The total number of accepted be species is estimated to be around `r be.all` and `r be.syns` total names including synonyms. The NCBI GenBank and BOLD databases were searched on `r gb.date` (GenBank version `r gb.version`), and the search retrieved `r gb.acc` accessions from `r gb.spp` unique species. Below is presented a summary table of reference library coverage (Table 1), numbers of sequences represented per common species (Table 2), and the sequences added to the reference library in the most recent update (Table 3).
+
+
+**Table 1. Summary of coverage. Locus = mitochondrial gene; Fragment = metabarcode primer set; Total = total number of sequences; Cov. (all) = proportion of all species with at least one sequence; Cov. (common) = proportion of common species with at least one sequence; Cov. (rare) = proportion of rare species with at least one sequence; Singletons = proportion of species represented by only one sequence, only including those with >0 sequences; Haps (mean) = mean number unique haplotypes per species; Haps (median) = median number unique haplotypes per species.**
+
+```{r print_summary, echo=FALSE, results="asis", warning=FALSE}
+options(knitr.kable.NA="",digits=2)
+# print the summary table
+marker.table.pretty %>%
+    mutate(Locus=str_to_upper(Locus),Fragment=str_to_title(Fragment)) %>%
+    kable()
+```
+
+
+**Table 2. Numbers of sequences represented per species for each primer set metabarcode fragment.**
+
+```{r print_big, echo=FALSE, results="asis", warning=FALSE}
+options(knitr.kable.NA="")
+# print the common species table
+reflib.by.marker %>%
+    mutate(locus=str_to_upper(str_split_fixed(marker,"\\.",2)[,1])) %>% 
+    mutate(fragment=str_to_title(str_split_fixed(marker,"\\.",2)[,2])) %>%
+    mutate(marker=paste0(locus," (",fragment,")")) %>%
+    dplyr::select(-locus,-fragment) %>%
+    pivot_wider(names_from=marker,values_from=genbankCount,values_fill=0) %>%
+    arrange(class,order,family,sciNameValid) %>%
+    filter(commonSpecies==TRUE) %>%
+    dplyr::select(-class,-order,-genus,-commonSpecies) %>%
+    relocate(commonName,.after=sciNameValid) %>%
+    mutate(sciNameValid=str_replace_all(sciNameValid, pattern="$|^", replacement="*")) %>%
+    rename(Family=family, `Scientific Name`=sciNameValid, `Common Name`=commonName) %>%
+    kable()
+```
+
+
+**Table 3. Numbers of new sequences for latest reference library version compared to previous. Current version is GenBank v`r gb.version` (`r gb.date`); previous version is GenBank v`r gb.version.old` (`r gb.date.old`).**
+
+```{r print_versions, echo=FALSE, results="asis", warning=FALSE}
+options(knitr.kable.NA="")
+# print the common species table
+reflib.new.by.marker %>%
+    mutate(locus=str_to_upper(str_split_fixed(marker,"\\.",2)[,1])) %>% 
+    mutate(fragment=str_to_title(str_split_fixed(marker,"\\.",2)[,2])) %>%
+    mutate(marker=paste0(locus," (",fragment,")")) %>%
+    dplyr::select(-locus,-fragment) %>%
+    pivot_wider(names_from=marker,values_from=genbankCount,values_fill=0) %>%
+    arrange(sciNameValid) %>%
+    mutate(sciNameValid=str_replace_all(sciNameValid, pattern="$|^", replacement="*")) %>%
+    rename(`Scientific Name`=sciNameValid) %>%
+    kable()
+```
