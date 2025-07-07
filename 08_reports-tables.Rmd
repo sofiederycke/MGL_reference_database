@@ -40,7 +40,7 @@ source(here::here(paste0(proj.path,"Scripts/references-clean.R")))
 ```
 
 ##### Methods and description
-This document describes the contents of the be fish reference library, generated from public databases. 
+This document describes the content of the reference libraries used for assigning taxonomy to amplicon sequence (12S and COI markergenes)data for fishes associated with Belgium, generated from public databases. 
 The document is a dynamic knitr document and can be updated quickly using the Makefile in `Scripts/`.
 A list of species from the be was generated from two sources: FishBase, and the longterm trawl-data available in-house.
 This list was filtered to identify synonyms and duplicates, and annotated with FishBase taxonomic classification and FishBase common names.
